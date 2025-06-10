@@ -5,6 +5,7 @@ enrollments from CSV files.
 import pandas as pd
 import random
 import ast # For safely evaluating string representations of lists
+import logging
 
 def generate_simulated_enrollment_data(num_exams, num_students, num_slots, exams_per_student):
     """
@@ -28,7 +29,7 @@ def generate_simulated_enrollment_data(num_exams, num_students, num_slots, exams
             - ConflictingPairs_list (list): List of exam pairs that share at least one student.
             - N_common_dict (dict): Maps exam pairs to the number of students taking both.
     """
-    print("--- Generating Simulated Data ---")
+    logging.info("--- Generating Simulated Data ---")
     if num_exams <= 0 or num_students <= 0 or num_slots <= 0:
          raise ValueError("Number of exams, students, and slots must be positive.")
     if not isinstance(exams_per_student, int) or not (1 <= exams_per_student <= num_exams):
@@ -40,7 +41,7 @@ def generate_simulated_enrollment_data(num_exams, num_students, num_slots, exams
     Enrollments_dict = {s: [] for s in Students_list} # Corresponds to E_s for each s
     # ExamEnrollmentCount = {e: 0 for e in Exams_list} # Not directly returned, but used internally
 
-    print(f"Assigning exactly {exams_per_student} exams to each student.")
+    logging.info(f"Assigning exactly {exams_per_student} exams to each student.")
     for s in Students_list:
         # Ensure we don't try to sample more exams than available
         num_to_sample = min(exams_per_student, len(Exams_list))
@@ -68,13 +69,13 @@ def generate_simulated_enrollment_data(num_exams, num_students, num_slots, exams
                     N_common_dict[pair] = common_students_count
                     ConflictingPairs_list.append(pair)
 
-    print(f"Generated {num_exams} exams, {num_students} students, {num_slots} time slots.")
-    print(f"Total student enrollments: {sum(len(v) for v in Enrollments_dict.values())}")
+    logging.info(f"Generated {num_exams} exams, {num_students} students, {num_slots} time slots.")
+    logging.info(f"Total student enrollments: {sum(len(v) for v in Enrollments_dict.values())}")
     ConflictingPairs_list = sorted(list(set(ConflictingPairs_list))) # Ensure uniqueness and sort
-    print(f"Number of unique conflicting exam pairs: {len(ConflictingPairs_list)}")
+    logging.info(f"Number of unique conflicting exam pairs: {len(ConflictingPairs_list)}")
     if len(ConflictingPairs_list) == 0 and num_exams > 1 and num_students > 0 and exams_per_student > 1:
-        print("Warning: No conflicting exam pairs found. This might be unusual depending on parameters.")
-    print("-" * 30)
+        logging.warning("No conflicting exam pairs found. This might be unusual depending on parameters.")
+    logging.info("-" * 30)
     return Exams_list, TimeSlots_list, Students_list, Enrollments_dict, ConflictingPairs_list, N_common_dict
 
 def load_and_structure_student_enrollments(csv_file_path):
@@ -97,14 +98,14 @@ def load_and_structure_student_enrollments(csv_file_path):
             - max_exams_per_student (int): Maximum number of exams any single student is enrolled in.
         Returns (None, None, 0) if loading fails or data is invalid.
     """
-    print(f"--- Loading and Structuring Student Enrollments from {csv_file_path} ---")
+    logging.info(f"--- Loading and Structuring Student Enrollments from {csv_file_path} ---")
     try:
         df = pd.read_csv(csv_file_path)
     except FileNotFoundError:
-        print(f"ERROR: CSV file not found at {csv_file_path}")
+        logging.error(f"ERROR: CSV file not found at {csv_file_path}")
         return None, None, 0
     if 'student' not in df.columns or 'exams' not in df.columns:
-        print("ERROR: CSV must contain 'student' and 'exams' columns.")
+        logging.error("ERROR: CSV must contain 'student' and 'exams' columns.")
         return None, None, 0
 
     enrollments_grouped_by_pattern_size = {} # Key: num_exams_in_pattern, Value: {pattern_tuple: count}
@@ -118,7 +119,7 @@ def load_and_structure_student_enrollments(csv_file_path):
             # Safely evaluate the string representation of the list
             exams_list_for_student = ast.literal_eval(exams_list_str)
             if not isinstance(exams_list_for_student, list):
-                print(f"Warning: 'exams' column for student {student_id} is not a list: {exams_list_str}")
+                logging.warning(f"Warning: 'exams' column for student {student_id} is not a list: {exams_list_str}")
                 continue
 
             # Standardize exam IDs (string, stripped) and sort to create a canonical pattern
@@ -138,14 +139,14 @@ def load_and_structure_student_enrollments(csv_file_path):
                 enrollments_grouped_by_pattern_size[current_pattern_size].get(student_pattern_tuple, 0) + 1
 
         except (ValueError, SyntaxError) as e:
-            print(f"Warning: Could not parse exams for student {student_id}: '{exams_list_str}'. Error: {e}")
+            logging.warning(f"Warning: Could not parse exams for student {student_id}: '{exams_list_str}'. Error: {e}")
             continue
 
     if not unique_exam_ids:
-        print("Warning: No valid exam enrollments found in CSV.")
+        logging.warning("Warning: No valid exam enrollments found in CSV.")
         return None, None, 0
 
-    print(f"Loaded data. Found {len(unique_exam_ids)} unique exams across all students.")
-    print(f"Max exams any student takes: {max_exams_per_student}")
-    print("-" * 30)
+    logging.info(f"Loaded data. Found {len(unique_exam_ids)} unique exams across all students.")
+    logging.info(f"Max exams any student takes: {max_exams_per_student}")
+    logging.info("-" * 30)
     return enrollments_grouped_by_pattern_size, sorted(list(unique_exam_ids)), max_exams_per_student

@@ -5,64 +5,63 @@ penalties for exam spacing and generation of canonical schedule patterns.
 import itertools
 import math
 from functools import lru_cache
+import logging
 
-def _make_penalty_params_hashable_for_cache(penalty_params_dict):
+def _make_penalty_params_hashable_for_cache(gap_penalty_dict):
     """
-    Converts mutable parts of penalty_params_dict (set 'D', dict 'p_d')
-    to their immutable, hashable counterparts (frozenset, sorted tuple of items)
-    for use with lru_cache.
+    Converts the gap penalty dictionary to a hashable tuple of its items,
+    sorted by key, for use with lru_cache.
 
     Args:
-        penalty_params_dict (dict): The penalty parameters dictionary.
+        gap_penalty_dict (dict): The dictionary mapping gap sizes to penalties.
 
     Returns:
-        tuple: A tuple of key-value pairs, where 'D' and 'p_d' values are hashable.
+        tuple: A hashable, sorted tuple of (key, value) pairs from the dictionary.
     """
-    # Ensure 'D' and 'p_d' exist, even if empty, for consistent tuple structure
-    d_val = frozenset(penalty_params_dict.get('D', set()))
-    p_d_val = tuple(sorted(penalty_params_dict.get('p_d', {}).items()))
-    # Other params are typically numbers, already hashable
-    p_mplus_val = penalty_params_dict.get('p_Mplus', 0)
-    p0_val = penalty_params_dict.get('p0', 0)
-    return (('D', d_val), ('p_d', p_d_val), ('p_Mplus', p_mplus_val), ('p0', p0_val))
+    if not gap_penalty_dict:
+        return tuple()
+    return tuple(sorted(gap_penalty_dict.items()))
 
 @lru_cache(maxsize=None) # Cache results as penalties are frequently recalculated for same gaps
-def calculate_penalty_for_gap(gap, penalty_parameters_tuple):
+def calculate_penalty_for_gap(gap, gap_penalty_params_tuple):
     """
     Calculates the penalty for a given gap size between two consecutive exams.
-    Corresponds to P(g) in LaTeX (Eq. \ref{eq:penalty_func}).
+    This function is designed to work with the consolidated GAP_PENALTY_DICT.
 
     Args:
         gap (int or float): The time difference between two exams.
-        penalty_parameters_tuple (tuple): Hashable tuple of penalty parameters,
+        gap_penalty_params_tuple (tuple): A hashable tuple of (gap, penalty) pairs,
                                           as returned by _make_penalty_params_hashable_for_cache.
 
     Returns:
         float: The calculated penalty for the gap.
     """
-    # Reconstruct parameters from the hashable tuple
-    local_penalty_params = {}
-    D_set = frozenset()
-    p_d_dict = {}
-    for key, value in penalty_parameters_tuple:
-        if key == 'D': D_set = value
-        elif key == 'p_d': p_d_dict = dict(value) # Convert back to dict for easy lookup
-        else: local_penalty_params[key] = value
+    if not gap_penalty_params_tuple:
+        return 0.0
 
-    M_threshold = max(D_set) if D_set else -1 # M = max D in LaTeX
-    penalty_for_gap_ge_M = local_penalty_params.get('p_Mplus', 0) # p_M+ in LaTeX
-    penalty_for_zero_gap = local_penalty_params.get('p0', 0) # p_0 in LaTeX
+    # Reconstruct the dictionary from the hashable tuple for easy lookup
+    gap_penalty_dict = dict(gap_penalty_params_tuple)
 
-    if abs(gap - 0) < 1e-9: # Using tolerance for float comparison
-        return penalty_for_zero_gap
-    elif gap < 0: # Should not occur with time-sorted slots
-        return 0
-    elif gap in D_set:
-        return p_d_dict.get(gap, 0) # p_d in LaTeX
-    elif M_threshold >= 0 and gap >= M_threshold: # Check M_threshold >= 0 before using it
-        return penalty_for_gap_ge_M
-    else: # Gap is > 0, not in D, and < M (or D is empty)
-        return 0
+    # Identify the sentinel key for large gaps (the largest key in the dictionary)
+    # and the threshold for when to apply it.
+    all_keys = list(gap_penalty_dict.keys())
+    large_gap_sentinel_key = max(all_keys)
+    
+    # The threshold is the largest key that is NOT the sentinel key.
+    specific_gap_keys = [k for k in all_keys if k != large_gap_sentinel_key]
+    max_specific_gap_threshold = max(specific_gap_keys) if specific_gap_keys else -1
+
+    # Rule 1: Check for an exact match in the dictionary (handles gap 0 and specific gaps 1-6)
+    if gap in gap_penalty_dict:
+        return gap_penalty_dict[gap]
+    
+    # Rule 2: If gap is larger than any specifically defined gap, use the large-gap penalty
+    if gap > max_specific_gap_threshold:
+        return gap_penalty_dict.get(large_gap_sentinel_key, 0.0)
+
+    # Rule 3: If gap is not explicitly defined and not large enough for the sentinel penalty, it has no penalty.
+    # This covers cases like a gap of 6.5, for example.
+    return 0.0
 
 @lru_cache(maxsize=128) # Cache results for common (k, T, allow_reuse) combinations
 def generate_canonical_slot_permutations(num_exams_in_pattern, time_slots_tuple, allow_slot_reuse_in_pattern):
@@ -97,7 +96,7 @@ def generate_canonical_slot_permutations(num_exams_in_pattern, time_slots_tuple,
         try:
             num_potential_patterns = num_available_slots ** num_exams_in_pattern
         except OverflowError:
-            print(f"    ERROR: Canonical pattern count overflow ({num_available_slots}^{num_exams_in_pattern}).")
+            logging.error(f"    ERROR: Canonical pattern count overflow ({num_available_slots}^{num_exams_in_pattern}).")
             return None
         slot_iterator = itertools.product(time_slots_tuple, repeat=num_exams_in_pattern)
     else:
@@ -110,7 +109,7 @@ def generate_canonical_slot_permutations(num_exams_in_pattern, time_slots_tuple,
             else: # Fallback for older Python
                 num_potential_patterns = math.factorial(num_available_slots) // math.factorial(num_available_slots - num_exams_in_pattern)
         except (OverflowError, ValueError): # ValueError if n_slots < k_exams (already handled) or negative factorial
-            print(f"    ERROR: Canonical pattern permutation count error for P({num_available_slots}, {num_exams_in_pattern}).")
+            logging.error(f"    ERROR: Canonical pattern permutation count error for P({num_available_slots}, {num_exams_in_pattern}).")
             return None
         slot_iterator = itertools.permutations(time_slots_tuple, num_exams_in_pattern)
 
@@ -118,10 +117,10 @@ def generate_canonical_slot_permutations(num_exams_in_pattern, time_slots_tuple,
     warning_threshold = 1_000_000
     error_threshold = 10_000_000
     if num_potential_patterns > warning_threshold:
-        print(f"    WARNING: Canonical slot pattern generation for {num_exams_in_pattern} exams, {num_available_slots} slots: "
+        logging.warning(f"    WARNING: Canonical slot pattern generation for {num_exams_in_pattern} exams, {num_available_slots} slots: "
               f"{num_potential_patterns:,} potential patterns!")
     if num_potential_patterns > error_threshold:
-        print(f"    ERROR: Too many canonical patterns ({num_potential_patterns:,}) for {num_exams_in_pattern} exams. "
+        logging.error(f"    ERROR: Too many canonical patterns ({num_potential_patterns:,}) for {num_exams_in_pattern} exams. "
               f"Aborting for this k.")
         return None
 
@@ -131,7 +130,7 @@ def generate_canonical_slot_permutations(num_exams_in_pattern, time_slots_tuple,
     return tuple(slot_patterns)
 
 @lru_cache(maxsize=1024) # Cache costs for frequently occurring chronological slot patterns
-def calculate_cost_for_chronological_schedule(chronological_slot_pattern_tuple, penalty_parameters_tuple):
+def calculate_cost_for_chronological_schedule(chronological_slot_pattern_tuple, gap_penalty_params_tuple):
     """
     Calculates the total cost (U_pi in LaTeX) for a personal schedule,
     given that the exams in that schedule are already sorted by their assigned time slots.
@@ -142,7 +141,7 @@ def calculate_cost_for_chronological_schedule(chronological_slot_pattern_tuple, 
                                                   representing the schedule for a student's exams.
                                                   E.g., (slot_for_exam_A, slot_for_exam_B, ...)
                                                   where exam_A occurs before or at the same time as exam_B.
-        penalty_parameters_tuple (tuple): Hashable tuple of penalty parameters.
+        gap_penalty_params_tuple (tuple): Hashable tuple of penalty parameters.
 
     Returns:
         float: The total cost U_pi for this specific chronological arrangement of slots.
@@ -155,7 +154,7 @@ def calculate_cost_for_chronological_schedule(chronological_slot_pattern_tuple, 
     if num_exams_in_schedule >= 2:
         for k_idx in range(num_exams_in_schedule - 1):
             gap = chronological_slot_pattern_tuple[k_idx+1] - chronological_slot_pattern_tuple[k_idx]
-            penalty_for_this_gap = calculate_penalty_for_gap(gap, penalty_parameters_tuple)
+            penalty_for_this_gap = calculate_penalty_for_gap(gap, gap_penalty_params_tuple)
             current_total_gap_penalty += penalty_for_this_gap
 
     time_of_last_exam = chronological_slot_pattern_tuple[-1]
@@ -166,7 +165,7 @@ def calculate_cost_for_chronological_schedule(chronological_slot_pattern_tuple, 
 def calculate_canonical_schedule_costs(
     canonical_placeholder_exams_list,
     time_slots_set,
-    penalty_params_dict,
+    gap_penalty_dict,
     allow_slot_reuse_within_canonical_schedule=False
 ):
     """
@@ -178,7 +177,7 @@ def calculate_canonical_schedule_costs(
         canonical_placeholder_exams_list (list): A list of placeholder exam IDs
                                                  (e.g., ['__PEX__0', '__PEX__1']).
         time_slots_set (list or set): The set of available time slots (T in LaTeX).
-        penalty_params_dict (dict): The dictionary of penalty parameters.
+        gap_penalty_dict (dict): The dictionary of penalty parameters.
         allow_slot_reuse_within_canonical_schedule (bool): If True, placeholder exams
                                                            can be assigned to the same slot.
 
@@ -195,7 +194,7 @@ def calculate_canonical_schedule_costs(
         return {}
 
     time_slots_tuple = tuple(sorted(list(time_slots_set))) # Ensure consistent order for caching
-    penalty_parameters_tuple_for_cache = _make_penalty_params_hashable_for_cache(penalty_params_dict)
+    penalty_parameters_tuple_for_cache = _make_penalty_params_hashable_for_cache(gap_penalty_dict)
 
     # Generate permutations of slots for the placeholder exams
     # E.g., if num_exams=2, slots=(0,1), result could be ((0,1), (1,0), (0,0), (1,1))

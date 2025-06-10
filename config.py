@@ -14,7 +14,7 @@ NUM_EXAMS_IN_PATTERNS_FOR_OPTIMIZATION = 4
 that the Benders decomposition will focus on optimizing.
 """
 
-STUDENT_PATTERN_SUBSET_FRACTION = 0.001
+STUDENT_PATTERN_SUBSET_FRACTION = 0.1
 """Fraction of unique student patterns (with NUM_EXAMS_IN_PATTERNS_FOR_OPTIMIZATION exams)
 to be included in the Benders decomposition master problem.
 A value of 1.0 means all such patterns are included.
@@ -23,24 +23,42 @@ A value of 1.0 means all such patterns are included.
 NUM_TIME_SLOTS = 24
 """Total number of available time slots for scheduling exams (T in LaTeX)."""
 
-ALLOW_INTRA_PATTERN_CONFLICTS = True
-"""If True, a student's personal schedule (pi_s) can have multiple exams in the same slot,
+ALLOW_INTRA_PATTERN_CONFLICTS = True # consider removing, what is use case of it being false
+"""
+Recommended Setting: True, this ensures feasibility and may make schedules better overall at the cost of a few conflicts.
+If True, a student's personal schedule (pi_s) can have multiple exams in the same slot,
 and this is penalized by p0. The MP will not have hard student-clash constraints.
 If False, pi_s must be conflict-free, and the MP includes hard student-clash constraints.
 Corresponds to 'allow_conflicts' in LaTeX.
 """
 
-PENALTY_PARAMS = {
-    'D': {1, 2, 3, 4, 5, 6},  # Set of gap sizes with specific penalties (D in LaTeX)
-    'p_d': {1: 9, 2: 8.75, 3: 7.25, 4: 6.25, 5: 5.75, 6: 3},  # Penalty for gap d in D (p_d in LaTeX)
-    'p_Mplus': 2,  # Penalty for gaps >= M (p_M+ in LaTeX)
-    'p0': 100  # Penalty for zero gap (conflict, p_0 in LaTeX)
+GAP_PENALTY_DICT = {
+    # Key: Gap Size, Value: Penalty
+    0: 100,    # Penalty for a zero gap (conflict)
+    1: 9,
+    2: 8.75,
+    3: 7.25,
+    4: 6.25,
+    5: 5.75,
+    6: 3,
+    # Sentinel key for large gaps. Any gap >= 7 will use this penalty.
+    # The key (100) is arbitrary; it just needs to be a key that won't
+    # conflict with an actual gap size.
+    100: 2
 }
-"""Parameters defining the cost structure for student schedules."""
+"""
+A dictionary defining the cost structure for student schedules based on gap sizes.
+- Key `0` is the penalty for a direct conflict (zero gap).
+- Keys `1, 2, ...` are penalties for specific small gaps.
+- The largest key (sentinel `100`) defines the penalty for any gap size greater
+  than the largest specific gap defined (e.g., for all gaps >= 7 in this config).
+"""
 
 # --- Benders Algorithm Parameters ---
 MAX_BENDERS_ITERATIONS = 5
-"""Maximum number of iterations for the Benders decomposition algorithm (k_max in LaTeX)."""
+"""
+Recommended Setting: Large number so it doesn't cap out (10000)
+Maximum number of iterations for the Benders decomposition algorithm (k_max in LaTeX)."""
 
 BENDERS_ABSOLUTE_TOLERANCE = 1e-4
 """Absolute tolerance for convergence (UB - LB) (epsilon_abs in LaTeX)."""
@@ -49,7 +67,9 @@ BENDERS_RELATIVE_TOLERANCE = 1e-4
 """Relative tolerance for convergence ( (UB - LB) / |UB| ) (epsilon_rel in LaTeX)."""
 
 RELAX_MASTER_PROBLEM_VARIABLES = False
-"""If True, master problem scheduling variables (x_et) are continuous [0,1].
+"""
+Recommended Setting: False, only run true for algorithm experimentation/development.
+If True, master problem scheduling variables (x_et) are continuous [0,1].
 If False, they are binary {0,1} (relax_mp in LaTeX).
 """
 

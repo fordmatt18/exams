@@ -222,54 +222,175 @@ if __name__ == "__main__":
                 persistent_master_solver = None
         
         # --- Benders Decomposition Loop ---
-        process_pool_executor = None
+        # MODIFICATION START: The logic is split to handle parallel and sequential cases separately.
+        # This allows for proper lifecycle management of multiprocessing resources using 'with' statements,
+        # which is the primary fix for the deadlock/hanging issue.
+
         if config.USE_PARALLEL_SUBPROBLEM_SOLVING:
-            num_workers = config.NUM_SUBPROBLEM_WORKERS if config.NUM_SUBPROBLEM_WORKERS else (os.cpu_count() or 1)
-            
-            manager = multiprocessing.Manager()
-            work_queue = manager.Queue()
+            # The 'with' statements for the Manager and Executor ensure their processes are
+            # properly started and shut down, even if errors occur.
+            with multiprocessing.Manager() as manager:
+                num_workers = config.NUM_SUBPROBLEM_WORKERS if config.NUM_SUBPROBLEM_WORKERS else (os.cpu_count() or 1)
+                work_queue = manager.Queue()
 
-            sp_objective_weights = {
-                p_tuple: (target_student_pattern_counts[p_tuple] if config.REWEIGHT_SUBPROBLEM_OBJECTIVE_BY_PATTERN_COUNT else 1.0)
-                for p_tuple in student_patterns_for_benders_optimization
-            }
-            num_patterns = len(student_patterns_for_benders_optimization)
-            chunk_size = math.ceil(num_patterns / num_workers) if num_workers > 0 else num_patterns
-            
-            if chunk_size > 0:
-                pattern_chunks = [student_patterns_for_benders_optimization[i:i + chunk_size]
-                                  for i in range(0, num_patterns, chunk_size)]
-                for chunk in pattern_chunks:
-                    work_queue.put({
-                        'patterns': chunk,
-                        'weights': {p: sp_objective_weights[p] for p in chunk}
-                    })
+                sp_objective_weights = {
+                    p_tuple: (target_student_pattern_counts[p_tuple] if config.REWEIGHT_SUBPROBLEM_OBJECTIVE_BY_PATTERN_COUNT else 1.0)
+                    for p_tuple in student_patterns_for_benders_optimization
+                }
+                num_patterns = len(student_patterns_for_benders_optimization)
+                chunk_size = math.ceil(num_patterns / num_workers) if num_workers > 0 else num_patterns
+                
+                if chunk_size > 0:
+                    pattern_chunks = [student_patterns_for_benders_optimization[i:i + chunk_size]
+                                      for i in range(0, num_patterns, chunk_size)]
+                    for chunk in pattern_chunks:
+                        work_queue.put({
+                            'patterns': chunk,
+                            'weights': {p: sp_objective_weights[p] for p in chunk}
+                        })
 
-            # Prepare arguments for the one-time worker initialization, now including the solver name
-            init_args = (
-                k_for_canonical_generation,
-                all_time_slots,
-                precomputed_canonical_schedule_costs_by_k_exams[k_for_canonical_generation],
-                work_queue,
-                config.SUBPROBLEM_SOLVER # <-- ADDED: Pass the solver name
-            )
-            
-            logging.info(f"Initializing ProcessPoolExecutor with {num_workers} stateful workers.")
-            process_pool_executor = concurrent.futures.ProcessPoolExecutor(
-                max_workers=num_workers,
-                initializer=init_worker_sp,
-                initargs=init_args
-            )
-        
-        try:
-            if process_pool_executor:
-                process_pool_executor.__enter__()
+                init_args = (
+                    k_for_canonical_generation,
+                    all_time_slots,
+                    precomputed_canonical_schedule_costs_by_k_exams[k_for_canonical_generation],
+                    work_queue,
+                    config.SUBPROBLEM_SOLVER
+                )
+                
+                logging.info(f"Initializing ProcessPoolExecutor with {num_workers} stateful workers.")
+                with concurrent.futures.ProcessPoolExecutor(
+                    max_workers=num_workers,
+                    initializer=init_worker_sp,
+                    initargs=init_args
+                ) as process_pool_executor:
+                    
+                    # This is the Benders loop for the PARALLEL case.
+                    while current_benders_iteration < config.MAX_BENDERS_ITERATIONS:
+                        current_benders_iteration += 1
+                        logging.info(f"\n--- Benders Iteration {current_benders_iteration}/{config.MAX_BENDERS_ITERATIONS} ---")
 
+                        logging.info(f"Solving MP ({'Relaxed' if config.RELAX_MASTER_PROBLEM_VARIABLES else 'Integer'})...")
+                        iter_mp_solve_start_time = time.time()
+                        if use_persistent_solver_local_flag and persistent_master_solver:
+                            mp_results, mp_term_cond = solve_master_problem_persistent(persistent_master_solver, benders_master_model, suppress_solver_output=True, iteration_num=current_benders_iteration, print_debug_flag=config.PRINT_MASTER_PROBLEM_DEBUG_PERSISTENT)
+                        else:
+                            mp_results, mp_term_cond = solve_pyomo_model(benders_master_model, solver_name=config.MASTER_PROBLEM_SOLVER, suppress_solver_output=True)
+                        master_problem_solve_times.append(time.time() - iter_mp_solve_start_time)
+                        logging.info(f"MP Solve Time: {master_problem_solve_times[-1]:.3f}s")
+                        mp_status = mp_results.solver.status if mp_results and mp_results.solver else SolverStatus.error
+                        mp_solved_ok = mp_term_cond in [TerminationCondition.optimal, TerminationCondition.feasible]
+                        if not mp_solved_ok:
+                            logging.error(f"MP failed (Term: {mp_term_cond}, Status: {mp_status}). Stopping Benders loop.")
+                            break
+                        mp_obj_val_from_model = pyo.value(benders_master_model.Objective, exception=False)
+                        if mp_obj_val_from_model is None: mp_obj_val_from_model = lower_bound 
+                        lower_bound = max(lower_bound, mp_obj_val_from_model)
+                        lower_bound_history.append(lower_bound)
+                        current_master_schedule_solution = {(e, t): (pyo.value(benders_master_model.exam_assignment_vars[e, t], exception=False) if benders_master_model.exam_assignment_vars[e, t].value is not None else 0.0) for e in all_exam_ids for t in all_time_slots}
+                        logging.info(f"Iter {current_benders_iteration} LB (for OPTIMIZED patterns subset): {lower_bound:.4f}")
+                        if config.PRINT_MASTER_SOLUTION_X_BAR_PER_ITERATION:
+                            logging.debug("Current Master Schedule Solution (x_bar - non-zero values):")
+                            for (e_sol, t_sol), val_sol in current_master_schedule_solution.items():
+                                if abs(val_sol) > 1e-6 : logging.debug(f"  x[{e_sol},{t_sol}] = {val_sol:.4f}")
+                        
+                        logging.info(f"Solving SPs for {len(student_patterns_for_benders_optimization)} patterns (Parallel)...")
+                        iter_sp_total_start_time = time.time()
+                        
+                        map_args = [current_master_schedule_solution] * num_workers
+                        results_from_pool = process_pool_executor.map(solve_my_assigned_chunk_task, map_args)
+                        all_sp_results = list(itertools.chain.from_iterable(results_from_pool))
+
+                        # The rest of the loop logic (processing results, checking convergence, adding cuts) is identical for both cases.
+                        subproblem_results_this_iteration = {} 
+                        current_iteration_upper_bound_contribution = 0.0 
+                        any_subproblem_failed_this_iteration = False
+                        for result_dict in all_sp_results:
+                            p_tuple_res = result_dict['student_pattern_tuple']
+                            sp_cost = result_dict['cost'] 
+                            sp_duals = result_dict['duals']
+                            if result_dict['subproblem_failed_flag'] or result_dict['error_message']:
+                                logging.warning(f"SP for pattern {p_tuple_res} (k={k_for_canonical_generation}) failed or error. "
+                                                f"TermCond: {result_dict['term_cond']}, Error: {result_dict['error_message']}")
+                                any_subproblem_failed_this_iteration = True; sp_cost = float('inf'); sp_duals = {}
+                            subproblem_results_this_iteration[p_tuple_res] = {'cost': sp_cost, 'duals': sp_duals}
+                            if config.REWEIGHT_SUBPROBLEM_OBJECTIVE_BY_PATTERN_COUNT:
+                                current_iteration_upper_bound_contribution += sp_cost 
+                            else:
+                                student_count_for_ub = target_student_pattern_counts[p_tuple_res]
+                                weight = sp_objective_weights.get(p_tuple_res, 1.0)
+                                per_instance_cost = sp_cost / weight if weight != 0 else 0
+                                current_iteration_upper_bound_contribution += per_instance_cost * student_count_for_ub
+                        if any_subproblem_failed_this_iteration: current_iteration_upper_bound_contribution = float('inf')
+                        subproblem_phase_times.append(time.time() - iter_sp_total_start_time)
+                        logging.info(f"Total SP Time ({len(student_patterns_for_benders_optimization)} patterns): {subproblem_phase_times[-1]:.3f}s")
+                        if current_iteration_upper_bound_contribution < upper_bound:
+                            upper_bound = current_iteration_upper_bound_contribution
+                            best_master_schedule_solution = current_master_schedule_solution.copy()
+                            iteration_of_best_master_schedule = current_benders_iteration
+                        upper_bound_history.append(upper_bound)
+                        logging.info(f"Iter {current_benders_iteration} UB (for OPTIMIZED patterns subset): {upper_bound:.4f}" if upper_bound != float('inf') else f"Iter {current_benders_iteration} UB: inf")
+                        if upper_bound == float('inf') and lower_bound == float('inf') and current_benders_iteration > 1:
+                            logging.warning("Both LB and UB are infinite. Problem might be infeasible or unbounded.")
+                        elif upper_bound == float('inf'): logging.warning("UB is infinite this iteration.")
+                        elif lower_bound > -float('inf'):
+                            gap = upper_bound - lower_bound
+                            logging.info(f"Iter {current_benders_iteration} Gap: {gap:.4f}")
+                            relative_gap = gap / (abs(upper_bound) + 1e-9) if abs(upper_bound) > 1e-9 else (gap if abs(lower_bound) < 1e-9 else float('inf')) 
+                            logging.info(f"Iter {current_benders_iteration} Relative Gap: {relative_gap:.4%}" if relative_gap != float('inf') else f"Iter {current_benders_iteration} Relative Gap: inf")
+                            if gap <= config.BENDERS_ABSOLUTE_TOLERANCE or \
+                               (relative_gap != float('inf') and relative_gap <= config.BENDERS_RELATIVE_TOLERANCE):
+                                logging.info(f"\nConverged in {current_benders_iteration} iterations.")
+                                break
+                        else:
+                             logging.info("LB is -infinite, UB updated.")
+                        if not any_subproblem_failed_this_iteration:
+                            logging.info(f"Adding cuts for {len(subproblem_results_this_iteration)} patterns...")
+                            cut_count_this_iter = 0
+                            for p_tuple_cut, sp_info in subproblem_results_this_iteration.items():
+                                subproblem_obj_value = sp_info['cost']
+                                subproblem_linking_duals = sp_info['duals']
+                                if subproblem_obj_value == float('inf') or not subproblem_linking_duals: 
+                                    if config.PRINT_SUBPROBLEM_DUALS_PER_ITERATION: logging.debug(f"  Skipping cut for {p_tuple_cut}, obj={subproblem_obj_value}, no/empty duals.")
+                                    continue
+                                exams_in_pattern_for_cut = list(p_tuple_cut) 
+                                benders_cut_variable_terms = []
+                                weight_for_cut = sp_objective_weights.get(p_tuple_cut, 1.0)
+                                unweighted_subproblem_obj = subproblem_obj_value / weight_for_cut if weight_for_cut != 0 else 0
+                                benders_cut_constant_term = unweighted_subproblem_obj
+                                for e_c in exams_in_pattern_for_cut: 
+                                    if e_c not in all_exam_ids: continue 
+                                    for t_c in all_time_slots:
+                                        dual_idx = (e_c, t_c)
+                                        dual_val = subproblem_linking_duals.get(dual_idx)
+                                        x_bar_val = current_master_schedule_solution.get(dual_idx, 0.0)
+                                        if isinstance(dual_val, (int, float)):
+                                            benders_cut_variable_terms.append(dual_val * benders_master_model.exam_assignment_vars[e_c, t_c])
+                                            benders_cut_constant_term -= dual_val * x_bar_val
+                                if benders_cut_variable_terms or abs(benders_cut_constant_term) > 1e-9: 
+                                    final_cut_rhs_expression = sum(benders_cut_variable_terms) + benders_cut_constant_term
+                                    if p_tuple_cut in benders_master_model.STUDENT_PATTERNS_FOR_OPT: 
+                                        try:
+                                            benders_master_model.BendersCuts.add(
+                                                (current_benders_iteration, p_tuple_cut), 
+                                                expr=benders_master_model.student_pattern_expected_cost_vars[p_tuple_cut] >= final_cut_rhs_expression
+                                            )
+                                            cut_count_this_iter += 1
+                                        except Exception as add_cut_err: 
+                                            logging.error(f"Error adding cut for pattern {p_tuple_cut}, iter {current_benders_iteration}: {add_cut_err}")
+                            if cut_count_this_iter == 0 and current_benders_iteration < config.MAX_BENDERS_ITERATIONS: 
+                                logging.warning("Warn: No valid cuts added this iteration.")
+                            elif cut_count_this_iter > 0: logging.info(f"Added {cut_count_this_iter} cuts.")
+                        elif any_subproblem_failed_this_iteration: 
+                            logging.warning("Skipping cut generation due to SP failure(s).")
+                        if current_benders_iteration >= config.MAX_BENDERS_ITERATIONS: 
+                            logging.info("Max Benders iterations reached.")
+        else: # This block handles the SEQUENTIAL case.
+            # The Benders loop is duplicated here to keep the logic separate and avoid
+            # managing multiprocessing resources when they are not needed.
             while current_benders_iteration < config.MAX_BENDERS_ITERATIONS:
                 current_benders_iteration += 1
                 logging.info(f"\n--- Benders Iteration {current_benders_iteration}/{config.MAX_BENDERS_ITERATIONS} ---")
 
-                # ... (Master Problem solve logic is unchanged) ...
                 logging.info(f"Solving MP ({'Relaxed' if config.RELAX_MASTER_PROBLEM_VARIABLES else 'Integer'})...")
                 iter_mp_solve_start_time = time.time()
                 if use_persistent_solver_local_flag and persistent_master_solver:
@@ -294,28 +415,19 @@ if __name__ == "__main__":
                     for (e_sol, t_sol), val_sol in current_master_schedule_solution.items():
                         if abs(val_sol) > 1e-6 : logging.debug(f"  x[{e_sol},{t_sol}] = {val_sol:.4f}")
                 
-                # --- Solve Subproblems ---
-                logging.info(f"Solving SPs for {len(student_patterns_for_benders_optimization)} patterns "
-                             f"({'Parallel' if config.USE_PARALLEL_SUBPROBLEM_SOLVING else 'Sequential'})...")
+                logging.info(f"Solving SPs for {len(student_patterns_for_benders_optimization)} patterns (Sequential)...")
                 iter_sp_total_start_time = time.time()
                 
+                sp_objective_weights = {p_tuple: (target_student_pattern_counts[p_tuple] if config.REWEIGHT_SUBPROBLEM_OBJECTIVE_BY_PATTERN_COUNT else 1.0) for p_tuple in student_patterns_for_benders_optimization}
+                seq_work_queue = multiprocessing.Queue() # A dummy queue for the stateful worker pattern
+                seq_work_queue.put({'patterns': student_patterns_for_benders_optimization, 'weights': sp_objective_weights})
+                init_worker_sp(k_for_canonical_generation, all_time_slots, precomputed_canonical_schedule_costs_by_k_exams[k_for_canonical_generation], seq_work_queue, config.SUBPROBLEM_SOLVER)
+                all_sp_results = solve_my_assigned_chunk_task(current_master_schedule_solution)
+
+                # The rest of the loop logic (processing results, checking convergence, adding cuts) is identical for both cases.
                 subproblem_results_this_iteration = {} 
                 current_iteration_upper_bound_contribution = 0.0 
                 any_subproblem_failed_this_iteration = False
-                
-                all_sp_results = []
-                if config.USE_PARALLEL_SUBPROBLEM_SOLVING and process_pool_executor:
-                    map_args = [current_master_schedule_solution] * num_workers
-                    results_from_pool = process_pool_executor.map(solve_my_assigned_chunk_task, map_args)
-                    all_sp_results = list(itertools.chain.from_iterable(results_from_pool))
-                else: # Sequential
-                    sp_objective_weights = {p_tuple: (target_student_pattern_counts[p_tuple] if config.REWEIGHT_SUBPROBLEM_OBJECTIVE_BY_PATTERN_COUNT else 1.0) for p_tuple in student_patterns_for_benders_optimization}
-                    seq_work_queue = multiprocessing.Queue()
-                    seq_work_queue.put({'patterns': student_patterns_for_benders_optimization, 'weights': sp_objective_weights})
-                    init_worker_sp(k_for_canonical_generation, all_time_slots, precomputed_canonical_schedule_costs_by_k_exams[k_for_canonical_generation], seq_work_queue, config.SUBPROBLEM_SOLVER)
-                    all_sp_results = solve_my_assigned_chunk_task(current_master_schedule_solution)
-
-                # ... (Processing results and the rest of the loop is unchanged) ...
                 for result_dict in all_sp_results:
                     p_tuple_res = result_dict['student_pattern_tuple']
                     sp_cost = result_dict['cost'] 
@@ -396,10 +508,7 @@ if __name__ == "__main__":
                     logging.warning("Skipping cut generation due to SP failure(s).")
                 if current_benders_iteration >= config.MAX_BENDERS_ITERATIONS: 
                     logging.info("Max Benders iterations reached.")
-        finally: 
-            if process_pool_executor:
-                process_pool_executor.__exit__(None, None, None) 
-                logging.debug("Process pool executor shut down.")
+        # MODIFICATION END
         
         # --- Final Summary and Reporting ---
         # ... (This section is unchanged) ...

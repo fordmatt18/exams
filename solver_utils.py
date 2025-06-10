@@ -4,6 +4,7 @@ standard and persistent solvers, and extracting results like duals.
 """
 import pyomo.environ as pyo
 from pyomo.opt import SolverFactory, SolverStatus, TerminationCondition
+import logging
 
 def solve_master_problem_persistent(
     persistent_solver_instance,
@@ -34,25 +35,25 @@ def solve_master_problem_persistent(
         # For persistent solvers, load_solutions=True is often desired to update the model instance.
         results_object = persistent_solver_instance.solve(model, load_solutions=True, tee=not suppress_solver_output)
         if print_debug_flag:
-            print(f"DEBUG Iter {iteration_num} (Persistent MP Solve with load_solutions=True):")
+            logging.debug(f"DEBUG Iter {iteration_num} (Persistent MP Solve with load_solutions=True):")
             try:
                 # Accessing lower_bound can sometimes be problematic depending on solver/status
-                print(f"  Solver reported objective (from results.problem.lower_bound): {results_object.problem.lower_bound}")
+                logging.debug(f"  Solver reported objective (from results.problem.lower_bound): {results_object.problem.lower_bound}")
             except Exception as e_res_obj:
-                print(f"  Could not get objective from results.problem: {e_res_obj}")
+                logging.debug(f"  Could not get objective from results.problem: {e_res_obj}")
 
             # Check theta variable values after solve
             if hasattr(model, 'student_pattern_expected_cost_vars'): # Check if theta exists
                 for pattern_key in model.student_pattern_expected_cost_vars:
                     theta_var = model.student_pattern_expected_cost_vars[pattern_key]
                     if hasattr(theta_var, 'value') and theta_var.value is not None:
-                        print(f"  model.student_pattern_expected_cost_vars[{pattern_key}].value: {theta_var.value}")
+                        logging.debug(f"  model.student_pattern_expected_cost_vars[{pattern_key}].value: {theta_var.value}")
                     else:
-                        print(f"  model.student_pattern_expected_cost_vars[{pattern_key}] value is None or not present.")
+                        logging.debug(f"  model.student_pattern_expected_cost_vars[{pattern_key}] value is None or not present.")
         if results_object and results_object.solver:
             term_cond = results_object.solver.termination_condition
     except Exception as e:
-        print(f"Error solving with persistent MP solver: {e}")
+        logging.error(f"Error solving with persistent MP solver: {e}")
         # term_cond remains TerminationCondition.error
     return results_object, term_cond
 
@@ -74,11 +75,11 @@ def solve_pyomo_model(model, solver_name='cbc', suppress_solver_output=False):
     try:
         solver_instance = SolverFactory(solver_name)
     except Exception as e: # Covers ApplicationError if solver not found/configured
-        print(f"Solver Configuration Error for '{solver_name}': {e}")
+        logging.error(f"Solver Configuration Error for '{solver_name}': {e}")
         return None, TerminationCondition.error
 
     if not solver_instance.available(exception_flag=False): # Check if solver is actually available
-        print(f"Solver '{solver_name}' is not available or not found in PATH.")
+        logging.error(f"Solver '{solver_name}' is not available or not found in PATH.")
         return None, TerminationCondition.solverFailure # Or a more specific condition
 
     results_object = None
@@ -89,7 +90,7 @@ def solve_pyomo_model(model, solver_name='cbc', suppress_solver_output=False):
             term_cond = results_object.solver.termination_condition
     except Exception as e: # Broad exception for solver errors during the solve call
         model_name_str = model.name if model and hasattr(model, 'name') else 'UnnamedModel'
-        print(f"Solver Error ({type(e).__name__}) with '{solver_name}' on model '{model_name_str}': {e}")
+        logging.error(f"Solver Error ({type(e).__name__}) with '{solver_name}' on model '{model_name_str}': {e}")
         # term_cond remains TerminationCondition.error
     return results_object, term_cond
 
@@ -160,9 +161,9 @@ def solve_subproblem_and_get_duals(
                     except KeyError: # Should not happen if constraint_index is valid
                         pass # linking_constraint_duals[constraint_index] remains unset
             else:
-                print("Warning: Subproblem model solved optimally but 'LinkingConstraint' not found for dual extraction.")
+                logging.warning("Warning: Subproblem model solved optimally but 'LinkingConstraint' not found for dual extraction.")
         else:
-            print("Warning: Subproblem model solved optimally but 'dual' Suffix not found or not enabled.")
+            logging.warning("Warning: Subproblem model solved optimally but 'dual' Suffix not found or not enabled.")
     elif term_cond == TerminationCondition.infeasible:
         # Objective is effectively infinite, no useful duals.
         objective_value = float('inf')
